@@ -1,0 +1,24 @@
+schema_version: ultrasound_models.v1
+
+strategies:
+  boundary_derived:
+    description: Derive the fat polygon between the skin and eye-muscle boundaries.
+    labels:
+      - skin
+      - fat
+      - eye_muscle
+
+  multilabel:
+    description: Convert the transverse model's three channels to polygons.
+    channel_order:
+      - eye_muscle
+      - fat
+      - skin
+    thresholds:
+      eye_muscle: 0.60
+      fat: 0.45
+      skin: 0.55
+
+artifacts:
+  registry_path: null
+  input_contract_path: null

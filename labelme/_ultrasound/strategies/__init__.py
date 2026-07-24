@@ -1,0 +1,1 @@
+"""Ultrasound annotation strategies."""
