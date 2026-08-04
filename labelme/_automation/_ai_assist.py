@@ -62,10 +62,14 @@ class AiAssistSession:
             detections=_detections_from_annotations(response.annotations),
             iou_threshold=0.5,
         )
-        detections = suppress_detections_overlapping_existing_shapes(
-            detections=detections,
-            existing_shapes=existing_shapes,
-        )
+        if len(response.annotations) != 1:
+            # One raw annotation is the direct answer to the user's prompt, so
+            # it must survive even when it overlaps an existing Shape. Use the
+            # raw count so a Sweep reduced to one detection still deduplicates.
+            detections = suppress_detections_overlapping_existing_shapes(
+                detections=detections,
+                existing_shapes=existing_shapes,
+            )
         return shapes_from_detections(
             detections=detections,
             shape_type=self.output_format,
