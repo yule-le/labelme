@@ -35,11 +35,11 @@ A set of Shapes sharing a common `group_id`, marking them as belonging together.
 _Avoid_: instance (it is only one application of grouping), cluster.
 
 **AI Assist**:
-Interactive, prompt-driven Shape proposal on the canvas: the user places positive / negative points or draws a box on the Image and a vision model (SAM, SAM2, EfficientSAM, SAM3) returns candidate Shapes. A point prompt is answered by exactly one candidate Shape — the direct answer to the click. A SAM3 box prompt is a Sweep.
+Interactive, prompt-driven Shape proposal on the canvas: the user places positive / negative points or draws a box on the Image and a vision model (SAM, SAM2, EfficientSAM, SAM3) returns candidate Shapes. A point prompt contributes one candidate Shape, chosen by how well it satisfies the points and then by model confidence. A SAM3 box prompt is a Sweep. A candidate that matches an existing Shape highlights that Shape instead of duplicating it.
 _Avoid_: AI annotation (too vague — covers AI Text Prompt too), auto-annotation, automation.
 
 **Sweep**:
-An AI Assist box prompt whose model (SAM3) detects every matching object in and around the boxed region, proposing many candidate Shapes from one user action. Sweep proposals that match already-annotated regions are dropped as duplicates rather than re-proposed; a point prompt's direct answer is never treated as a duplicate.
+An AI Assist box prompt whose model (SAM3) detects every matching object in and around the boxed region, proposing many candidate Shapes from one user action. Each unmatched candidate becomes a new Shape; each candidate matching an existing Shape highlights its closest match instead.
 _Avoid_: propagation (model-internal term), batch detection.
 
 **AI Text Prompt**:
