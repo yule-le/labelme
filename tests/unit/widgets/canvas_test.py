@@ -832,6 +832,46 @@ def test_add_point_to_edge_repaints(
 
 
 @pytest.mark.gui
+def test_plain_click_adds_point_to_selected_polygon_edge(canvas: Canvas) -> None:
+    shape = _make_polygon()
+    canvas.load_shapes(shapes=[shape])
+    canvas.selected_shapes = [shape]
+    canvas._last_hovered_shape = shape
+    canvas._last_hovered_edge = 0
+    canvas._hovered_edge = 0
+    canvas._prev_move_point = QPointF(25, 10)
+
+    n_before = len(shape.points)
+    press_consumed = canvas._maybe_modify_polygon_topology(
+        Qt.KeyboardModifier.NoModifier
+    )
+
+    assert len(shape.points) == n_before + 1
+    assert press_consumed is True
+    assert canvas.selected_shapes == [shape]
+
+
+@pytest.mark.gui
+def test_plain_click_does_not_add_point_to_unselected_polygon_edge(
+    canvas: Canvas,
+) -> None:
+    shape = _make_polygon()
+    canvas.load_shapes(shapes=[shape])
+    canvas._last_hovered_shape = shape
+    canvas._last_hovered_edge = 0
+    canvas._hovered_edge = 0
+    canvas._prev_move_point = QPointF(25, 10)
+
+    n_before = len(shape.points)
+    press_consumed = canvas._maybe_modify_polygon_topology(
+        Qt.KeyboardModifier.NoModifier
+    )
+
+    assert len(shape.points) == n_before
+    assert press_consumed is False
+
+
+@pytest.mark.gui
 def test_remove_selected_point_repaints(
     canvas: Canvas, monkeypatch: pytest.MonkeyPatch
 ) -> None:

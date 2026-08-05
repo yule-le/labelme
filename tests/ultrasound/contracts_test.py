@@ -8,6 +8,7 @@ def test_annotation_prediction_is_always_a_polygon() -> None:
         label="fat",
         points=((0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (0.0, 1.0)),
         confidence=0.9,
+        source_target="derived_fat",
         strategy="boundary_derived",
     )
 

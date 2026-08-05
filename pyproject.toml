@@ -37,6 +37,12 @@ dependencies = [
 ]
 dynamic = ["readme", "version"]
 
+[project.optional-dependencies]
+ultrasound = [
+  "torch>=2.7,<2.8",
+  "torchvision>=0.22,<0.23",
+]
+
 [tool.hatch.metadata.hooks.fancy-pypi-readme]
 content-type = "text/markdown"
 fragments = [{ path = "README.md" }]
@@ -72,7 +78,10 @@ labelme = "labelme.__main__:main"
 
 [tool.pytest.ini_options]
 qt_api = "pyside6"
-markers = ["gui: mark a test as a GUI test."]
+markers = [
+  "gui: mark a test as a GUI test.",
+  "ultrasound_model: requires local published model artifacts and PyTorch.",
+]
 
 [tool.ruff.lint]
 select = [

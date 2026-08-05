@@ -165,6 +165,11 @@ class Canvas(QtWidgets.QWidget):
     _hovered_edge: int | None
     _last_hovered_edge: int | None
     _hovered_rotation: int | None
+    _vertex_marquee_start: QPointF | None
+    _vertex_marquee_end: QPointF | None
+    _vertex_marquee_shape: Shape | None
+    _vertex_marquee_indices: set[int]
+    _vertex_marquee_dragging: bool
 
     zoom_request = QtCore.Signal(int, QPointF)
     scroll_request = QtCore.Signal(int, Qt.Orientation)
@@ -443,6 +448,7 @@ class Canvas(QtWidgets.QWidget):
         # this entry as the new current state.
         self.shapes = self.shape_backups.pop()
         self.selected_shapes.clear()
+        self.clear_vertex_marquee()
         self.update()
 
     def enterEvent(self, a0: QtCore.QEvent) -> None:
@@ -471,6 +477,7 @@ class Canvas(QtWidgets.QWidget):
             self.update()  # clear crosshair
         else:
             # EDIT -> CREATE
+            self.clear_vertex_marquee()
             need_update: bool = self._set_highlight(
                 hovered_shape=None,
                 hovered_edge=None,
@@ -530,6 +537,13 @@ class Canvas(QtWidgets.QWidget):
         else:
             assert self.mode == _CanvasMode.EDIT
             messages.append(self.tr("Editing shapes"))
+            if self._vertex_marquee_dragging:
+                messages.append(self.tr("Drag to select polygon points"))
+            elif self.has_vertex_marquee:
+                messages.append(
+                    self.tr("Delete to remove %d selected points; ESC to cancel")
+                    % len(self._vertex_marquee_indices)
+                )
         if extra_messages:
             messages.extend(extra_messages)
         self.status_updated.emit(" • ".join(messages))
@@ -578,6 +592,104 @@ class Canvas(QtWidgets.QWidget):
             return self.tr("Click third corner to close oriented rectangle")
         return self.tr("Click to add point")
 
+    @property
+    def has_vertex_marquee(self) -> bool:
+        return (
+            self._vertex_marquee_shape is not None
+            and self._vertex_marquee_start is not None
+            and self._vertex_marquee_end is not None
+        )
+
+    @property
+    def selected_vertex_indices(self) -> frozenset[int]:
+        return frozenset(self._vertex_marquee_indices)
+
+    def clear_vertex_marquee(self) -> bool:
+        had_marquee = self.has_vertex_marquee or self._vertex_marquee_dragging
+        self._vertex_marquee_start = None
+        self._vertex_marquee_end = None
+        self._vertex_marquee_shape = None
+        self._vertex_marquee_indices.clear()
+        self._vertex_marquee_dragging = False
+        if had_marquee:
+            self.update()
+            self._update_status()
+        return had_marquee
+
+    def apply_shape_selection(self, shapes: list[Shape]) -> None:
+        if self._vertex_marquee_shape is not None and shapes != [
+            self._vertex_marquee_shape
+        ]:
+            self.clear_vertex_marquee()
+        self.selected_shapes = shapes
+
+    def _can_start_vertex_marquee(self) -> bool:
+        return (
+            len(self.selected_shapes) == 1
+            and self.selected_shapes[0].shape_type == "polygon"
+            and self.selected_shapes[0].visible
+        )
+
+    def _begin_vertex_marquee(self, pos: QPointF) -> None:
+        assert self._can_start_vertex_marquee()
+        self.clear_vertex_marquee()
+        self._vertex_marquee_start = QPointF(pos)
+        self._vertex_marquee_end = QPointF(pos)
+        self._vertex_marquee_shape = self.selected_shapes[0]
+        self._vertex_marquee_dragging = True
+        self._clear_highlight_state()
+        self._hovered_vertex = None
+        self._hovered_edge = None
+        self._hovered_rotation = None
+        self._update_vertex_marquee(pos=pos)
+
+    def _update_vertex_marquee(self, pos: QPointF) -> None:
+        if not self._vertex_marquee_dragging:
+            return
+        assert self._vertex_marquee_start is not None
+        assert self._vertex_marquee_shape is not None
+        self._vertex_marquee_end = QPointF(pos)
+        left = min(self._vertex_marquee_start.x(), pos.x())
+        right = max(self._vertex_marquee_start.x(), pos.x())
+        top = min(self._vertex_marquee_start.y(), pos.y())
+        bottom = max(self._vertex_marquee_start.y(), pos.y())
+        self._vertex_marquee_indices = {
+            index
+            for index, (x, y) in enumerate(self._vertex_marquee_shape.points)
+            if left <= x <= right and top <= y <= bottom
+        }
+        self.update()
+        self._update_status()
+
+    def _finish_vertex_marquee(self) -> None:
+        if not self._vertex_marquee_dragging:
+            return
+        self._vertex_marquee_dragging = False
+        self.update()
+        self._update_status()
+
+    def delete_selected_vertices(self) -> bool:
+        shape = self._vertex_marquee_shape
+        indices = sorted(self._vertex_marquee_indices)
+        if shape is None or not indices:
+            return False
+        if shape not in self.shapes or self.selected_shapes != [shape]:
+            self.clear_vertex_marquee()
+            return False
+        if len(shape.points) - len(indices) < 3:
+            return False
+        shape.points = np.delete(shape.points, indices, axis=0)
+        shape.point_labels = np.delete(shape.point_labels, indices)
+        self.backup_shapes()
+        self.clear_vertex_marquee()
+        self._clear_highlight_state()
+        self.hovered_shape = None
+        self._hovered_vertex = None
+        self._hovered_edge = None
+        self._hovered_rotation = None
+        self.update()
+        return True
+
     def mouseMoveEvent(self, a0: QtGui.QMouseEvent) -> None:
         try:
             pos = self._transform_point_widget_to_image(a0.position())
@@ -593,6 +705,9 @@ class Canvas(QtWidgets.QWidget):
             return
         if self.mode == _CanvasMode.CREATE:
             self._track_drawing_cursor(pos=pos, event=event)
+            return
+        if self._vertex_marquee_dragging:
+            self._update_vertex_marquee(pos=pos)
             return
         buttons = event.buttons()
         if buttons & Qt.MouseButton.RightButton:
@@ -866,7 +981,12 @@ class Canvas(QtWidgets.QWidget):
                 hovered_rotation=None,
             )
             self._apply_cursor(CursorRole.HANDLE)
-            status_messages.append(self.tr("ALT + Click to create point on shape"))
+            if target.shape in self.selected_shapes:
+                status_messages.append(self.tr("Click to create point on shape"))
+            else:
+                status_messages.append(
+                    self.tr("Click to select shape; ALT + Click to create point")
+                )
             self.update()
             return
 
@@ -890,6 +1010,7 @@ class Canvas(QtWidgets.QWidget):
         typing.assert_never(target.kind)
 
     def add_point_to_edge(self) -> None:
+        self.clear_vertex_marquee()
         shape = self._last_hovered_shape
         index = self._last_hovered_edge
         point = self._prev_move_point
@@ -905,6 +1026,7 @@ class Canvas(QtWidgets.QWidget):
         self.update()
 
     def remove_selected_point(self) -> bool:
+        self.clear_vertex_marquee()
         shape = self._last_hovered_shape
         index = self._last_hovered_vertex
         if shape is None or index is None or not shape.can_remove_point():
@@ -949,6 +1071,10 @@ class Canvas(QtWidgets.QWidget):
             )
             return
         if self.mode == _CanvasMode.EDIT:
+            if is_shift_pressed and self._can_start_vertex_marquee():
+                self._begin_vertex_marquee(pos=pos)
+                return
+            self.clear_vertex_marquee()
             self._press_left_while_editing(pos=pos, event=event)
 
     def _press_left_while_drawing(
@@ -1083,12 +1209,21 @@ class Canvas(QtWidgets.QWidget):
         self.update()
 
     def _maybe_modify_polygon_topology(self, modifiers: Qt.KeyboardModifier) -> bool:
-        # Returns True only when the press is consumed as a terminal edit (a point
-        # removal), so the caller skips point selection and starts no drag. Adding
-        # a point intentionally falls through so the new vertex can be dragged.
-        if self._is_edge_selected() and modifiers == Qt.KeyboardModifier.AltModifier:
+        # Returns True when the press is consumed by a topology edit, so the
+        # caller does not run normal shape selection afterward. The inserted
+        # vertex remains hovered and can still be dragged by the same press.
+        hovered_shape_is_selected = (
+            self._last_hovered_shape is not None
+            and self._last_hovered_shape in self.selected_shapes
+        )
+        add_with_plain_click = (
+            modifiers == Qt.KeyboardModifier.NoModifier and hovered_shape_is_selected
+        )
+        if self._is_edge_selected() and (
+            modifiers == Qt.KeyboardModifier.AltModifier or add_with_plain_click
+        ):
             self.add_point_to_edge()
-            return False
+            return True
         if self._is_vertex_selected() and modifiers == (
             Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier
         ):
@@ -1122,6 +1257,9 @@ class Canvas(QtWidgets.QWidget):
             self._release_right(event=event)
             return
         if button == Qt.MouseButton.LeftButton:
+            if self._vertex_marquee_dragging:
+                self._finish_vertex_marquee()
+                return
             self._release_left()
             return
         if button == Qt.MouseButton.MiddleButton:
@@ -1249,6 +1387,10 @@ class Canvas(QtWidgets.QWidget):
         self._finalize()
 
     def select_shapes(self, shapes: list[Shape]) -> None:
+        if self._vertex_marquee_shape is not None and shapes != [
+            self._vertex_marquee_shape
+        ]:
+            self.clear_vertex_marquee()
         self.selection_changed.emit(shapes)
         self.update()
 
@@ -1376,6 +1518,7 @@ class Canvas(QtWidgets.QWidget):
         return True
 
     def deselect_shape(self) -> bool:
+        self.clear_vertex_marquee()
         if not self.selected_shapes:
             return False
         self.selection_changed.emit([])
@@ -1385,6 +1528,7 @@ class Canvas(QtWidgets.QWidget):
     def delete_selected(self) -> list[Shape]:
         if not self.selected_shapes:
             return []
+        self.clear_vertex_marquee()
         removed = list(self.selected_shapes)
         self.shapes = [s for s in self.shapes if s not in self.selected_shapes]
         self.backup_shapes()
@@ -1393,6 +1537,8 @@ class Canvas(QtWidgets.QWidget):
         return removed
 
     def delete_shape(self, shape: Shape) -> None:
+        if shape is self._vertex_marquee_shape:
+            self.clear_vertex_marquee()
         if shape in self.selected_shapes:
             self.selected_shapes.remove(shape)
         self.shapes = [s for s in self.shapes if s is not shape]
@@ -1435,6 +1581,7 @@ class Canvas(QtWidgets.QWidget):
             self._draw_active_shape_layer,
             self._draw_drag_copy_layer,
             self._draw_preview_overlay_layer,
+            self._draw_vertex_marquee_layer,
         )
 
     def _draw_pixmap_layer(self, painter: QtGui.QPainter) -> None:
@@ -1521,6 +1668,33 @@ class Canvas(QtWidgets.QWidget):
             rotation_highlight=None,
         )
         render_shape(painter=painter, shape=preview, context=context)
+
+    def _draw_vertex_marquee_layer(self, painter: QtGui.QPainter) -> None:
+        if not self.has_vertex_marquee:
+            return
+        assert self._vertex_marquee_start is not None
+        assert self._vertex_marquee_end is not None
+        assert self._vertex_marquee_shape is not None
+
+        accent = QtGui.QColor(255, 64, 96)
+        pen = QtGui.QPen(accent)
+        pen.setWidth(2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(QtGui.QColor(255, 64, 96, 35))
+        start = self._vertex_marquee_start * self.scale
+        end = self._vertex_marquee_end * self.scale
+        painter.drawRect(QtCore.QRectF(start, end).normalized())
+
+        pen.setStyle(Qt.PenStyle.SolidLine)
+        painter.setPen(pen)
+        painter.setBrush(QtGui.QColor(255, 235, 59))
+        radius = max(4.0, self._point_size * 0.75)
+        for index in sorted(self._vertex_marquee_indices):
+            if index >= len(self._vertex_marquee_shape.points):
+                continue
+            x, y = self._vertex_marquee_shape.points[index] * self.scale
+            painter.drawEllipse(QPointF(float(x), float(y)), radius, radius)
 
     def _render_draft(
         self, painter: QtGui.QPainter, draft: _DraftShape, highlighted: bool
@@ -1699,7 +1873,9 @@ class Canvas(QtWidgets.QWidget):
             elif modifiers == Qt.KeyboardModifier.AltModifier:
                 self._snapping = False
         elif self.mode == _CanvasMode.EDIT:
-            if key == Qt.Key.Key_Up:
+            if key == Qt.Key.Key_Escape and self.clear_vertex_marquee():
+                pass
+            elif key == Qt.Key.Key_Up:
                 self._move_by_keyboard(QPointF(0.0, -MOVE_SPEED))
             elif key == Qt.Key.Key_Down:
                 self._move_by_keyboard(QPointF(0.0, MOVE_SPEED))
@@ -1797,6 +1973,7 @@ class Canvas(QtWidgets.QWidget):
             self._cancel_current_shape()
 
     def _reset_interaction_state(self) -> None:
+        self.clear_vertex_marquee()
         self._current = None
         self.hovered_shape = None
         self._hovered_vertex = None
@@ -1863,6 +2040,11 @@ class Canvas(QtWidgets.QWidget):
         self._hovered_edge = None
         self._last_hovered_edge = None
         self._hovered_rotation = None
+        self._vertex_marquee_start = None
+        self._vertex_marquee_end = None
+        self._vertex_marquee_shape = None
+        self._vertex_marquee_indices = set()
+        self._vertex_marquee_dragging = False
         self.update()
 
 

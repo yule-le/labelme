@@ -1,148 +1,125 @@
 from __future__ import annotations
 
-import typing
 from collections.abc import Callable
+from typing import cast
 
-from loguru import logger
 from PySide6 import QtCore
-from PySide6 import QtGui
 from PySide6 import QtWidgets
-from PySide6.QtCore import Qt
 
 from .._automation import AiOutputFormat
+from .._ultrasound import UltrasoundTask
 from ._info_button import InfoButton
 
 
 class AiAssistedAnnotationWidget(QtWidgets.QWidget):
+    """Compact transverse-ultrasound controls in the existing AI toolbar slot."""
+
     hover_highlight_requested = QtCore.Signal(bool)
-
-    _available_models: list[tuple[str, str]] = [
-        ("efficientsam:10m", "EfficientSam (speed)"),
-        ("efficientsam:latest", "EfficientSam (accuracy)"),
-        ("sam:100m", "Sam (speed)"),
-        ("sam:300m", "Sam (balanced)"),
-        ("sam:latest", "Sam (accuracy)"),
-        ("sam2:small", "Sam2 (speed)"),
-        ("sam2:latest", "Sam2 (balanced)"),
-        ("sam2:large", "Sam2 (accuracy)"),
-        ("sam3:latest", "Sam3"),
-    ]
-
-    _model_combo: QtWidgets.QComboBox
-    _output_format_combo: QtWidgets.QComboBox
-    _body: QtWidgets.QWidget
 
     def __init__(
         self,
-        default_model: str,
-        on_model_changed: Callable[[str], None],
-        on_output_format_changed: Callable[[AiOutputFormat], None],
+        on_run_current: Callable[[], None],
+        on_run_folder: Callable[[], None],
+        on_generate_fat: Callable[[], None],
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent=parent)
-        self._init_ui(
-            default_model=default_model,
-            on_model_changed=on_model_changed,
-            on_output_format_changed=on_output_format_changed,
-        )
+        self._on_run_current = on_run_current
+        self._on_run_folder = on_run_folder
+        self._on_generate_fat = on_generate_fat
+        self._task_checkboxes: dict[UltrasoundTask, QtWidgets.QCheckBox] = {}
+        self._init_ui()
 
     @property
     def output_format(self) -> AiOutputFormat:
-        return self._output_format_combo.currentData()
+        """Keep AI text/point tools producing polygons after this UI is repurposed."""
 
-    def _init_ui(
-        self,
-        default_model: str,
-        on_model_changed: Callable[[str], None],
-        on_output_format_changed: Callable[[AiOutputFormat], None],
-    ) -> None:
-        layout = QtWidgets.QVBoxLayout()
+        return cast(AiOutputFormat, "polygon")
+
+    @property
+    def selected_tasks(self) -> tuple[UltrasoundTask, ...]:
+        return tuple(
+            task for task in ("EMA", "skin") if self._task_checkboxes[task].isChecked()
+        )
+
+    def set_task_checked(self, task: UltrasoundTask, checked: bool) -> None:
+        if task == "fat":
+            raise ValueError("Fat is generated from edited EMA and skin polygons.")
+        self._task_checkboxes[task].setChecked(checked)
+
+    def _init_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(2)
-        self.setLayout(layout)
 
         header_layout = QtWidgets.QHBoxLayout()
         header_layout.addStretch()
-        label = QtWidgets.QLabel(self.tr("AI-Assisted Annotation"))
-        header_layout.addWidget(label)
-        info_button = InfoButton(
-            tooltip=self.tr("AI suggests annotation in 'AI-Points' and 'AI-Box' modes")
+        header_layout.addWidget(QtWidgets.QLabel(self.tr("AI-Assisted Annotation")))
+        header_layout.addWidget(
+            InfoButton(
+                tooltip=self.tr(
+                    "Run transverse ultrasound EMA and skin models. "
+                    "Fat is derived from their anatomical boundaries."
+                )
+            )
         )
-        header_layout.addWidget(info_button)
         header_layout.addStretch()
         layout.addLayout(header_layout)
 
-        self._body = body = QtWidgets.QWidget()
-        self.installEventFilter(self)
-        body.installEventFilter(self)
-        body_layout = QtWidgets.QVBoxLayout()
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        body_layout.setSpacing(0)
-        body.setLayout(body_layout)
+        model_combo = QtWidgets.QComboBox()
+        model_combo.addItem(self.tr("Transverse"), "transverse")
+        model_combo.setEnabled(False)
+        layout.addWidget(model_combo)
 
-        self._model_combo = QtWidgets.QComboBox()
-        for model_id, model_display in self._available_models:
-            self._model_combo.addItem(model_display, model_id)
-        body_layout.addWidget(self._model_combo)
+        tasks_layout = QtWidgets.QHBoxLayout()
+        tasks_layout.setContentsMargins(0, 0, 0, 0)
+        tasks_layout.setSpacing(6)
+        for task, display, checked in (
+            ("EMA", "EMA", True),
+            ("skin", "skin", True),
+        ):
+            checkbox = QtWidgets.QCheckBox(display)
+            checkbox.setChecked(checked)
+            self._task_checkboxes[task] = checkbox
+            tasks_layout.addWidget(checkbox)
+        layout.addLayout(tasks_layout)
 
-        self._output_format_combo = QtWidgets.QComboBox()
-        self._output_format_combo.addItem("Polygon", "polygon")
-        self._output_format_combo.addItem("Mask", "mask")
-        self._output_format_combo.addItem("Rectangle", "rectangle")
-        self._output_format_combo.addItem("Oriented Rectangle", "oriented_rectangle")
-        self._output_format_combo.addItem("Circle", "circle")
-        body_layout.addWidget(self._output_format_combo)
+        buttons_layout = QtWidgets.QHBoxLayout()
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        self._run_current_button = QtWidgets.QPushButton(self.tr("Run Current"))
+        self._run_current_button.clicked.connect(self._on_run_current)
+        buttons_layout.addWidget(self._run_current_button)
+        self._run_folder_button = QtWidgets.QPushButton(self.tr("Run Folder"))
+        self._run_folder_button.clicked.connect(self._on_run_folder)
+        buttons_layout.addWidget(self._run_folder_button)
+        layout.addLayout(buttons_layout)
 
-        layout.addWidget(body)
-
-        model_ui_names = [model_display for _, model_display in self._available_models]
-        if default_model in model_ui_names:
-            model_index = model_ui_names.index(default_model)
-        else:
-            logger.warning("Default AI model is not found: {!r}", default_model)
-            model_index = 0
-
-        self._model_combo.currentIndexChanged.connect(
-            lambda index: on_model_changed(self._model_combo.itemData(index))
+        self._generate_fat_button = QtWidgets.QPushButton(self.tr("Generate Fat"))
+        self._generate_fat_button.setToolTip(
+            self.tr("Use the edited skin lower boundary and EMA upper boundary")
         )
-        self._model_combo.setCurrentIndex(model_index)
+        self._generate_fat_button.clicked.connect(self._on_generate_fat)
+        layout.addWidget(self._generate_fat_button)
 
-        self._output_format_combo.currentIndexChanged.connect(
-            lambda index: on_output_format_changed(
-                self._output_format_combo.itemData(index)
-            )
+        self.setMaximumWidth(230)
+
+    def set_busy(self, *, current: bool = False, folder: bool = False) -> None:
+        busy = current or folder
+        for checkbox in self._task_checkboxes.values():
+            checkbox.setEnabled(not busy)
+        self._generate_fat_button.setEnabled(not busy and self.isEnabled())
+        self._run_current_button.setEnabled(not busy and self.isEnabled())
+        self._run_folder_button.setEnabled(self.isEnabled())
+        self._run_folder_button.setText(
+            self.tr("Cancel") if folder else self.tr("Run Folder")
         )
-        self._output_format_combo.setCurrentIndex(0)
 
-        self.setMaximumWidth(200)
+    def setEnabled(self, enabled: bool) -> None:
+        super().setEnabled(enabled)
+        if not enabled:
+            self.hover_highlight_requested.emit(False)
 
     def set_disabled_models(self, disabled_models: tuple[str, ...]) -> None:
-        model = typing.cast(QtGui.QStandardItemModel, self._model_combo.model())
-        for i in range(self._model_combo.count()):
-            model_id = self._model_combo.itemData(i)
-            item = model.item(i)
-            assert item is not None
-            if model_id in disabled_models:
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
-            else:
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
+        """Compatibility no-op for the retained AI-Points/AI-Box canvas modes."""
 
-    def setEnabled(self, a0: bool) -> None:
-        self._body.setEnabled(a0)
-        self.hover_highlight_requested.emit(False)
-
-    def eventFilter(self, a0: QtCore.QObject, a1: QtCore.QEvent) -> bool:
-        if a0 in (self, self._body) and not self._body.isEnabled():
-            if a1.type() == QtCore.QEvent.Type.Enter:
-                QtWidgets.QToolTip.showText(
-                    QtGui.QCursor.pos(),
-                    self.tr(
-                        "Select 'AI-Points' or 'AI-Box' mode "
-                        "to enable AI-Assisted Annotation"
-                    ),
-                    self,
-                )
-                self.hover_highlight_requested.emit(True)
-            elif a1.type() == QtCore.QEvent.Type.Leave:
-                self.hover_highlight_requested.emit(False)
-        return super().eventFilter(a0, a1)
+        del disabled_models

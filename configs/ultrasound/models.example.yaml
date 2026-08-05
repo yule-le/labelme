@@ -1,24 +1,40 @@
 schema_version: ultrasound_models.v1
 
-strategies:
-  boundary_derived:
-    description: Derive the fat polygon between the skin and eye-muscle boundaries.
-    labels:
-      - skin
-      - fat
-      - eye_muscle
+# Copy this file to models.local.yaml and replace the paths with the published
+# artifacts on the local machine. models.local.yaml is intentionally ignored.
+# Optional local directory initially shown by Labelme's Open Folder dialog.
+annotation_root: null
 
-  multilabel:
-    description: Convert the transverse model's three channels to polygons.
-    channel_order:
-      - eye_muscle
-      - fat
-      - skin
-    thresholds:
-      eye_muscle: 0.60
-      fat: 0.45
-      skin: 0.55
+models:
+  eye_muscle:
+    model_id: seg_eye_muscle
+    artifact_id: seg_eye_muscle__transverse__v1
+    export_label: EMA
+    weights_path: null
+    config_path: null
+    threshold: 0.50
+    min_component_area: 64
+    polygon_tolerance: 1.5
+    roi:
+      raw_size_wh: [800, 600]
+      rectangle_xywh: [92, 31, 536, 536]
+      accept_cropped_size: true
+      # Prepared ROI batches may use different crop templates and dimensions.
+      accept_variable_cropped_size: true
 
-artifacts:
-  registry_path: null
-  input_contract_path: null
+  # This is a separate model, not a channel from the experimental
+  # seg_multilabel artifact.
+  skin:
+    model_id: seg_skin
+    artifact_id: seg_skin__transverse__v1
+    export_label: skin
+    weights_path: null
+    config_path: null
+    threshold: 0.50
+    min_component_area: 64
+    polygon_tolerance: 1.5
+    roi:
+      raw_size_wh: [800, 600]
+      rectangle_xywh: [92, 31, 536, 536]
+      accept_cropped_size: true
+      accept_variable_cropped_size: true

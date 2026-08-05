@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added non-blocking transverse-ultrasound controls to the AI-Assisted Annotation toolbar, with independent EMA/skin task selection, fat derived on demand from the edited canvas boundaries, an opt-in image-level expert-review marker, current-image and skip-existing folder runs, cancellation, failure summaries, reversible ROI coordinates, one-step undo, and ordinary editable Labelme polygons without auto-generated metadata. <!-- Add the PR link once assigned. -->
+- Added Shift-drag marquee selection for vertices of one selected polygon; Delete removes the selected vertices and reconnects retained neighbors, Escape cancels, Undo restores the edit, and the operation is blocked if fewer than three polygon points would remain. <!-- Add the PR link once assigned. -->
+
+### Changed
+
+- Changed Open Folder to start from the optional local ultrasound `annotation_root`, allowing users to select a transverse ROI batch directly while retaining the normal fallback when it is not configured. <!-- Add the PR link once assigned. -->
+- Changed polygon refinement so a plain left-click on the edge of an already selected polygon inserts a new editable vertex; the first click on an unselected polygon still only selects it, while Alt-click and the context-menu action remain available. <!-- Add the PR link once assigned. -->
+- Replaced the ultrasound toolbar's AI Text-to-Annotation panel with independent, default-off `Needs expert review` and `Model failure` image-status checkboxes, persisted together in the extensible `ultrasoundReview` object without modifying shape metadata. <!-- Add the PR link once assigned. -->
+- Increased the menu bar and menu-item text to a minimum of 11 points for clearer annotation-workstation use. <!-- Add the PR link once assigned. -->
+
+### Fixed
+
+- Fixed ultrasound auto-labeling rejecting prepared ROI batches whose crop-template dimensions differ from the original `536 x 536` batch, such as `roi_t_b006` at `599 x 538`; variable-size prepared ROIs now use the full image and restore predictions to its exact coordinates. <!-- Add the PR link once assigned. -->
+- Fixed the removed AI Text-to-Annotation widget rendering at the main-window origin and overlapping the `File`, `Edit`, `View`, and `Help` menu labels. <!-- Add the PR link once assigned. -->
+
 ## [7.0.4] - 2026-07-12
 
 ### Fixed

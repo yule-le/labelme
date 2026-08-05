@@ -46,20 +46,26 @@ def canvas(qtbot: QtBot) -> Canvas:
     return c
 
 
-def _make_move_event(pos: QPointF) -> QtGui.QMouseEvent:
+def _make_move_event(
+    pos: QPointF,
+    *,
+    buttons: Qt.MouseButton = Qt.MouseButton.NoButton,
+    modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+) -> QtGui.QMouseEvent:
     return QtGui.QMouseEvent(
         QtCore.QEvent.Type.MouseMove,
         pos,
         pos,
         Qt.MouseButton.NoButton,
-        Qt.MouseButton.NoButton,
-        Qt.KeyboardModifier.NoModifier,
+        buttons,
+        modifiers,
     )
 
 
 def _make_press_event(
     pos: QPointF,
     button: Qt.MouseButton = Qt.MouseButton.RightButton,
+    modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
 ) -> QtGui.QMouseEvent:
     return QtGui.QMouseEvent(
         QtCore.QEvent.Type.MouseButtonPress,
@@ -67,13 +73,14 @@ def _make_press_event(
         pos,
         button,
         button,
-        Qt.KeyboardModifier.NoModifier,
+        modifiers,
     )
 
 
 def _make_release_event(
     pos: QPointF,
     button: Qt.MouseButton = Qt.MouseButton.RightButton,
+    modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
 ) -> QtGui.QMouseEvent:
     return QtGui.QMouseEvent(
         QtCore.QEvent.Type.MouseButtonRelease,
@@ -81,7 +88,7 @@ def _make_release_event(
         pos,
         button,
         Qt.MouseButton.NoButton,
-        Qt.KeyboardModifier.NoModifier,
+        modifiers,
     )
 
 
@@ -96,6 +103,117 @@ def _image_to_widget(canvas: Canvas, img_x: float, img_y: float) -> QPointF:
 def _clear_cursor_override(canvas: Canvas) -> None:
     """Remove any outstanding override cursor pushed by the canvas."""
     canvas._release_cursor()
+
+
+@pytest.mark.gui
+def test_plain_edge_click_selects_then_inserts_polygon_vertex(canvas: Canvas) -> None:
+    shape = Shape(
+        shape_type="polygon",
+        points=np.array([(20, 20), (180, 20), (180, 80), (20, 80)]),
+        closed=True,
+    )
+    canvas.load_shapes(shapes=[shape])
+    canvas.set_editing(value=True)
+    canvas.selection_changed.connect(
+        lambda shapes: setattr(canvas, "selected_shapes", shapes)
+    )
+    edge = _image_to_widget(canvas=canvas, img_x=100, img_y=20)
+    canvas.mouseMoveEvent(_make_move_event(pos=edge))
+
+    canvas.mousePressEvent(
+        _make_press_event(pos=edge, button=Qt.MouseButton.LeftButton)
+    )
+
+    assert canvas.selected_shapes == [shape]
+    assert len(shape.points) == 4
+
+    canvas.mousePressEvent(
+        _make_press_event(pos=edge, button=Qt.MouseButton.LeftButton)
+    )
+
+    assert canvas.selected_shapes == [shape]
+    assert len(shape.points) == 5
+
+
+@pytest.mark.gui
+def test_shift_drag_selects_and_deletes_polygon_vertices(canvas: Canvas) -> None:
+    shape = Shape(
+        shape_type="polygon",
+        points=np.array([(10, 10), (50, 10), (90, 10), (90, 80), (50, 80), (10, 80)]),
+        closed=True,
+    )
+    canvas.load_shapes(shapes=[shape])
+    canvas.set_editing(value=True)
+    canvas.selected_shapes = [shape]
+    start = _image_to_widget(canvas=canvas, img_x=40, img_y=0)
+    end = _image_to_widget(canvas=canvas, img_x=100, img_y=30)
+
+    canvas.mousePressEvent(
+        _make_press_event(
+            pos=start,
+            button=Qt.MouseButton.LeftButton,
+            modifiers=Qt.KeyboardModifier.ShiftModifier,
+        )
+    )
+    canvas.mouseMoveEvent(
+        _make_move_event(
+            pos=end,
+            buttons=Qt.MouseButton.LeftButton,
+            modifiers=Qt.KeyboardModifier.ShiftModifier,
+        )
+    )
+    canvas.mouseReleaseEvent(
+        _make_release_event(
+            pos=end,
+            button=Qt.MouseButton.LeftButton,
+            modifiers=Qt.KeyboardModifier.ShiftModifier,
+        )
+    )
+
+    assert canvas.has_vertex_marquee
+    assert canvas.selected_vertex_indices == {1, 2}
+    assert canvas.delete_selected_vertices()
+    assert not canvas.has_vertex_marquee
+    assert shape.points.tolist() == [
+        [10.0, 10.0],
+        [90.0, 80.0],
+        [50.0, 80.0],
+        [10.0, 80.0],
+    ]
+    assert len(shape.point_labels) == len(shape.points)
+
+    canvas.restore_last_shape()
+    assert len(canvas.shapes[0].points) == 6
+
+
+@pytest.mark.gui
+def test_vertex_marquee_blocks_degenerate_delete_and_escape_cancels(
+    canvas: Canvas,
+) -> None:
+    shape = Shape(
+        shape_type="polygon",
+        points=np.array([(10, 10), (50, 10), (90, 10), (50, 80)]),
+        closed=True,
+    )
+    canvas.load_shapes(shapes=[shape])
+    canvas.selected_shapes = [shape]
+    canvas._begin_vertex_marquee(pos=QPointF(0, 0))
+    canvas._update_vertex_marquee(pos=QPointF(100, 20))
+    canvas._finish_vertex_marquee()
+
+    assert canvas.selected_vertex_indices == {0, 1, 2}
+    assert not canvas.delete_selected_vertices()
+    assert len(shape.points) == 4
+    assert canvas.has_vertex_marquee
+
+    canvas.keyPressEvent(
+        QtGui.QKeyEvent(
+            QtCore.QEvent.Type.KeyPress,
+            Qt.Key.Key_Escape,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+    assert not canvas.has_vertex_marquee
 
 
 # ---------------------------------------------------------------------------

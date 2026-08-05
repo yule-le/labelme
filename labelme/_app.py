@@ -9,6 +9,7 @@ import re
 import subprocess
 import time
 import typing
+import uuid
 import webbrowser
 from pathlib import Path
 from typing import Final
@@ -46,6 +47,18 @@ from ._label_file import write_label_file
 from ._shape import Shape
 from ._shape import ShapeType
 from ._shape_clipboard import ShapeClipboard
+from ._ultrasound import AnnotationPrediction
+from ._ultrasound import BatchInferenceItem
+from ._ultrasound import BatchInferenceRequest
+from ._ultrasound import BatchInferenceResult
+from ._ultrasound import InferenceRequest
+from ._ultrasound import InferenceResult
+from ._ultrasound import ProcessedSegmentation
+from ._ultrasound.config import UltrasoundConfigError
+from ._ultrasound.config import load_annotation_root
+from ._ultrasound.labelme_adapter import prediction_to_shape
+from ._ultrasound.strategies import derive_fat_segmentation
+from ._ultrasound.worker import UltrasoundInferenceWorker
 from ._widgets import AiAssistedAnnotationWidget
 from ._widgets import AiTextToAnnotationWidget
 from ._widgets import BrightnessContrastDialog
@@ -57,12 +70,14 @@ from ._widgets import Palette
 from ._widgets import SettingsDialog
 from ._widgets import StatusStats
 from ._widgets import ToolBar
+from ._widgets import UltrasoundReviewWidget
 from ._widgets import UniqueLabelQListWidget
 from ._widgets import ZoomWidget
 from ._widgets import download_ai_model
 from ._widgets import format_shape_label
 
 LABEL_COLORMAP: NDArray[np.uint8] = imgviz.label_colormap()
+_ULTRASOUND_REVIEW_KEY: Final[str] = "ultrasoundReview"
 
 
 class _ZoomMode(enum.Enum):
@@ -166,6 +181,9 @@ class _Menus(NamedTuple):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    ultrasound_inference_requested = QtCore.Signal(object)
+    ultrasound_batch_requested = QtCore.Signal(object)
+
     _config_file: Path | None
     _config: dict
     _config_overrides: dict
@@ -184,6 +202,7 @@ class MainWindow(QtWidgets.QMainWindow):
     _settings_dialog: SettingsDialog | None = None
     _ai_annotation: AiAssistedAnnotationWidget
     _ai_text: AiTextToAnnotationWidget
+    _ultrasound_review: UltrasoundReviewWidget
 
     _output_dir: Path | None
     _image: QtGui.QImage
@@ -195,6 +214,10 @@ class MainWindow(QtWidgets.QMainWindow):
     _brightness_contrast_values: dict[str, tuple[int | None, int | None]]
     _scroll_values: dict[Qt.Orientation, dict[str, float]]
     _default_state: QtCore.QByteArray
+    _ultrasound_thread: QtCore.QThread | None = None
+    _ultrasound_worker: UltrasoundInferenceWorker | None = None
+    _ultrasound_request_id: str | None = None
+    _ultrasound_batch_request_id: str | None = None
 
     def __init__(
         self,
@@ -227,11 +250,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._actions.paste.setEnabled
         )
         self._menus = self._setup_menus()
+        self._configure_menu_fonts()
 
         self._ai_annotation = AiAssistedAnnotationWidget(
-            default_model=self._config["ai"]["default"],
-            on_model_changed=self._canvas_widgets.canvas.set_ai_model_name,
-            on_output_format_changed=self._canvas_widgets.canvas.set_ai_output_format,
+            on_run_current=self._start_ultrasound_auto_label,
+            on_run_folder=self._start_or_cancel_ultrasound_batch,
+            on_generate_fat=self._generate_fat_from_edited_shapes,
             parent=self,
         )
         self._ai_annotation.setEnabled(False)
@@ -241,6 +265,16 @@ class MainWindow(QtWidgets.QMainWindow):
             on_submit=self._submit_ai_prompt, parent=self
         )
         self._ai_text.setEnabled(False)
+        # The ultrasound workflow removes this widget from the toolbar. Keep
+        # the retained compatibility object explicitly hidden so Qt does not
+        # place this layout-less child at (0, 0) over the menu bar.
+        self._ai_text.hide()
+
+        self._ultrasound_review = UltrasoundReviewWidget(
+            on_status_changed=self._on_ultrasound_review_changed,
+            parent=self,
+        )
+        self._ultrasound_review.setEnabled(False)
 
         self._setup_toolbars()
 
@@ -926,12 +960,20 @@ class MainWindow(QtWidgets.QMainWindow):
             label_list=label_menu,
         )
 
+    def _configure_menu_fonts(self) -> None:
+        font = QtGui.QFont(self.menuBar().font())
+        current_size = font.pointSizeF()
+        font.setPointSizeF(max(11.0, current_size * 1.2))
+        self.menuBar().setFont(font)
+        for menu in self._menus:
+            menu.setFont(font)
+
     def _setup_toolbars(self) -> None:
         select_ai_model = QtWidgets.QWidgetAction(self)
         select_ai_model.setDefaultWidget(self._ai_annotation)
 
-        ai_prompt_action = QtWidgets.QWidgetAction(self)
-        ai_prompt_action.setDefaultWidget(self._ai_text)
+        review_status_action = QtWidgets.QWidgetAction(self)
+        review_status_action.setDefaultWidget(self._ultrasound_review)
 
         self.addToolBar(
             Qt.ToolBarArea.TopToolBarArea,
@@ -956,7 +998,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     None,
                     select_ai_model,
                     None,
-                    ai_prompt_action,
+                    review_status_action,
                 ],
                 font_base=self.font(),
             ),
@@ -1321,6 +1363,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def update_action_states(self, value: bool = True) -> None:
         for action in (*self._actions.zoom, *self._actions.on_load_active):
             action.setEnabled(value)
+        self._ai_annotation.setEnabled(
+            value
+            and self._ultrasound_request_id is None
+            and self._ultrasound_batch_request_id is None
+        )
+        self._ultrasound_review.setEnabled(value)
 
     def show_status_message(self, message: str, delay: int = 500) -> None:
         self.statusBar().showMessage(message, delay)
@@ -1443,6 +1491,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._annotation = None
         self._image_path = None
         self._label_file_path = None
+        self._ultrasound_review.set_status(review_required=False, model_failure=False)
         self._canvas_widgets.canvas.reset_state()
 
     # Callbacks
@@ -1499,11 +1548,12 @@ class MainWindow(QtWidgets.QMainWindow):
             and create_mode
             in (*typing.get_args(_TextToAnnotationCreateMode), *_AI_CREATE_MODES)
         )
-        self._ai_annotation.setEnabled(not edit and create_mode in _AI_CREATE_MODES)
-        if create_mode == "ai_points_to_shape":
-            self._ai_annotation.set_disabled_models(_AI_MODELS_WITHOUT_POINT_SUPPORT)
-        else:
-            self._ai_annotation.set_disabled_models(())
+        self._ai_annotation.setEnabled(
+            self._image_path is not None
+            and self._ultrasound_request_id is None
+            and self._ultrasound_batch_request_id is None
+        )
+        self._ultrasound_review.setEnabled(self._image_path is not None)
 
     def _highlight_ai_buttons(self, highlight: bool) -> None:
         self._ai_buttons_highlighted = highlight
@@ -1671,7 +1721,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._label_selection_changed
         )
         self._docks.label_list.clearSelection()
-        self._canvas_widgets.canvas.selected_shapes = selected_shapes
+        self._canvas_widgets.canvas.apply_shape_selection(selected_shapes)
         for shape in self._canvas_widgets.canvas.selected_shapes:
             item = self._docks.label_list.find_item_by_shape(shape)
             self._docks.label_list.select_item(item)
@@ -1925,6 +1975,384 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_inference_failed(self, message: str) -> None:
         self.show_status_message(self.tr("AI inference failed: %s") % message, 10000)
 
+    def _on_ultrasound_review_changed(
+        self, required: bool, model_failure: bool
+    ) -> None:
+        if self._annotation is None or self._image_path is None:
+            return
+        if required or model_failure:
+            review = self._annotation.other_data.get(_ULTRASOUND_REVIEW_KEY)
+            if not isinstance(review, dict):
+                review = {}
+                self._annotation.other_data[_ULTRASOUND_REVIEW_KEY] = review
+            review["required"] = required
+            review["modelFailure"] = model_failure
+            review.setdefault("reasons", [])
+            review.setdefault("note", "")
+        else:
+            self._annotation.other_data.pop(_ULTRASOUND_REVIEW_KEY, None)
+        self.mark_dirty()
+
+    def _sync_ultrasound_review_widget(self) -> None:
+        required = False
+        model_failure = False
+        if self._annotation is not None:
+            review = self._annotation.other_data.get(_ULTRASOUND_REVIEW_KEY)
+            if isinstance(review, dict):
+                required = review.get("required") is True
+                model_failure = review.get("modelFailure") is True
+        self._ultrasound_review.set_status(
+            review_required=required, model_failure=model_failure
+        )
+
+    def _generate_fat_from_edited_shapes(self) -> None:
+        if self._image_path is None:
+            self.show_status_message(
+                self.tr("Open an image before generating fat."), 5000
+            )
+            return
+        canvas = self._canvas_widgets.canvas
+        ema_shapes = [
+            shape
+            for shape in canvas.shapes
+            if shape.label == "EMA" and shape.shape_type == "polygon"
+        ]
+        skin_shapes = [
+            shape
+            for shape in canvas.shapes
+            if shape.label == "skin" and shape.shape_type == "polygon"
+        ]
+        if len(ema_shapes) != 1 or len(skin_shapes) != 1:
+            self.show_error_message(
+                self.tr("Cannot generate fat"),
+                self.tr(
+                    "Generate fat requires exactly one EMA polygon and one "
+                    "skin polygon. Found EMA: %d, skin: %d."
+                )
+                % (len(ema_shapes), len(skin_shapes)),
+            )
+            return
+
+        image_shape = (self._image.height(), self._image.width())
+        ema_mask = _utils.shape_to_mask(
+            img_shape=image_shape,
+            points=ema_shapes[0].points.tolist(),
+            shape_type="polygon",
+        )
+        skin_mask = _utils.shape_to_mask(
+            img_shape=image_shape,
+            points=skin_shapes[0].points.tolist(),
+            shape_type="polygon",
+        )
+        eye_muscle = ProcessedSegmentation(
+            annotation=AnnotationPrediction(
+                label="EMA",
+                points=tuple(map(tuple, ema_shapes[0].points.tolist())),
+                confidence=None,
+                source_target="eye_muscle",
+                strategy="single_model",
+            ),
+            mask=ema_mask,
+        )
+        skin = ProcessedSegmentation(
+            annotation=AnnotationPrediction(
+                label="skin",
+                points=tuple(map(tuple, skin_shapes[0].points.tolist())),
+                confidence=None,
+                source_target="skin",
+                strategy="single_model",
+            ),
+            mask=skin_mask,
+        )
+        fat = derive_fat_segmentation(skin=skin, eye_muscle=eye_muscle)
+        if fat is None:
+            self.show_error_message(
+                self.tr("Cannot generate fat"),
+                self.tr(
+                    "The edited skin lower boundary must remain above the "
+                    "edited EMA upper boundary over a shared horizontal range."
+                ),
+            )
+            return
+
+        fat_shape = prediction_to_shape(fat.annotation)
+        if not canvas.shape_backups:
+            canvas.backup_shapes()
+        retained_shapes = [shape for shape in canvas.shapes if shape.label != "fat"]
+        self._docks.label_list.clear()
+        self._load_shapes(
+            shapes=[*retained_shapes, fat_shape],
+            replace=True,
+        )
+        canvas.select_shapes([fat_shape])
+        self.mark_dirty()
+        self.show_status_message(
+            self.tr("Generated fat from the edited EMA and skin boundaries."),
+            7000,
+        )
+
+    def _start_ultrasound_auto_label(self, _value: bool = False) -> None:
+        if self._image_path is None:
+            self.show_status_message(
+                self.tr("Open an image before auto-labeling."), 5000
+            )
+            return
+        if (
+            self._ultrasound_request_id is not None
+            or self._ultrasound_batch_request_id is not None
+        ):
+            self.show_status_message(
+                self.tr("Ultrasound auto-labeling is already running."), 5000
+            )
+            return
+        tasks = self._ai_annotation.selected_tasks
+        if not tasks:
+            self.show_status_message(
+                self.tr("Select at least one ultrasound task."), 5000
+            )
+            return
+
+        self._ensure_ultrasound_worker()
+        request_id = uuid.uuid4().hex
+        image_path = os.path.abspath(self._image_path)
+        image = np.asarray(_utils.img_qt_to_arr(self._image), dtype=np.uint8).copy()
+        request = InferenceRequest(
+            request_id=request_id,
+            image_path=image_path,
+            image=image,
+            tasks=tasks,
+        )
+        self._ultrasound_request_id = request_id
+        self._ai_annotation.set_busy(current=True)
+        self.show_status_message(
+            self.tr("Running transverse ultrasound tasks: %s…") % ", ".join(tasks),
+            0,
+        )
+        self.ultrasound_inference_requested.emit(request)
+
+    def _ensure_ultrasound_worker(self) -> None:
+        if self._ultrasound_thread is not None:
+            return
+        thread = QtCore.QThread()
+        worker = UltrasoundInferenceWorker()
+        worker.moveToThread(thread)
+        self.ultrasound_inference_requested.connect(worker.infer)
+        self.ultrasound_batch_requested.connect(worker.infer_batch)
+        worker.completed.connect(self._on_ultrasound_inference_completed)
+        worker.failed.connect(self._on_ultrasound_inference_failed)
+        worker.batch_progress.connect(self._on_ultrasound_batch_progress)
+        worker.batch_completed.connect(self._on_ultrasound_batch_completed)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        self._ultrasound_thread = thread
+        self._ultrasound_worker = worker
+
+    @QtCore.Slot(object)
+    def _on_ultrasound_inference_completed(self, result: object) -> None:
+        if not isinstance(result, InferenceResult):
+            raise TypeError("Expected InferenceResult.")
+        if result.request_id != self._ultrasound_request_id:
+            return
+        self._finish_ultrasound_request()
+        if self._image_path is None or not _same_path(
+            result.image_path, self._image_path
+        ):
+            self.show_status_message(
+                self.tr("Ignored ultrasound result because the current image changed."),
+                7000,
+            )
+            return
+        if not result.predictions:
+            self.show_status_message(
+                self.tr("The ultrasound models produced no annotations."), 7000
+            )
+            return
+
+        shapes = [prediction_to_shape(item) for item in result.predictions]
+        canvas = self._canvas_widgets.canvas
+        if not canvas.shape_backups:
+            canvas.backup_shapes()
+        generated_labels = {shape.label for shape in shapes}
+        retained_shapes = [
+            shape for shape in canvas.shapes if shape.label not in generated_labels
+        ]
+        self._docks.label_list.clear()
+        self._load_shapes(shapes=[*retained_shapes, *shapes], replace=True)
+        canvas.select_shapes(shapes)
+        self.mark_dirty()
+        self.show_status_message(
+            self.tr("Added ultrasound polygons: %s. Review them before saving.")
+            % ", ".join(shape.label or "" for shape in shapes),
+            7000,
+        )
+
+    @QtCore.Slot(str, str, str)
+    def _on_ultrasound_inference_failed(
+        self, request_id: str, image_path: str, message: str
+    ) -> None:
+        if request_id != self._ultrasound_request_id:
+            return
+        self._finish_ultrasound_request()
+        if self._image_path is None or not _same_path(image_path, self._image_path):
+            return
+        self.show_error_message(
+            self.tr("Ultrasound auto-labeling failed"),
+            self.tr("<b>%s</b>") % message,
+        )
+
+    def _finish_ultrasound_request(self) -> None:
+        self._ultrasound_request_id = None
+        self._ai_annotation.setEnabled(self._image_path is not None)
+        self._ai_annotation.set_busy()
+
+    def _start_or_cancel_ultrasound_batch(self) -> None:
+        if self._ultrasound_batch_request_id is not None:
+            if self._ultrasound_worker is not None:
+                self._ultrasound_worker.cancel_batch()
+            self.show_status_message(self.tr("Cancelling after the current image…"), 0)
+            return
+        self._start_ultrasound_batch()
+
+    def _start_ultrasound_batch(self) -> None:
+        if self._ultrasound_request_id is not None:
+            self.show_status_message(
+                self.tr("Wait for the current-image inference to finish."), 5000
+            )
+            return
+        if self._is_changed:
+            QtWidgets.QMessageBox.warning(
+                self,
+                self.tr("Unsaved annotations"),
+                self.tr(
+                    "Save or discard the current image changes before running "
+                    "folder auto-labeling."
+                ),
+            )
+            return
+        tasks = self._ai_annotation.selected_tasks
+        if not tasks:
+            self.show_status_message(
+                self.tr("Select at least one ultrasound task."), 5000
+            )
+            return
+        image_paths = self.image_list
+        if not image_paths:
+            self.show_status_message(
+                self.tr("Open an image folder before running a batch."), 5000
+            )
+            return
+        items = tuple(
+            BatchInferenceItem(
+                image_path=image_path,
+                label_path=_resolve_label_path(
+                    image_or_label_path=image_path,
+                    output_dir=self._output_dir,
+                ),
+            )
+            for image_path in image_paths
+        )
+        pending = sum(not Path(item.label_path).exists() for item in items)
+        if pending == 0:
+            self.show_status_message(
+                self.tr("Every image in this folder already has a JSON file."),
+                7000,
+            )
+            return
+        output_description = str(self._output_dir or Path(image_paths[0]).parent)
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            self.tr("Run folder auto-labeling"),
+            self.tr(
+                "Generate %s for %d unannotated image(s)?\n\n"
+                "Existing JSON files will be skipped.\n"
+                "Output: %s"
+            )
+            % (", ".join(tasks), pending, output_description),
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        self._ensure_ultrasound_worker()
+        request_id = uuid.uuid4().hex
+        self._ultrasound_batch_request_id = request_id
+        self._ai_annotation.set_busy(folder=True)
+        self.show_status_message(
+            self.tr("Starting folder auto-labeling for %d image(s)…") % pending,
+            0,
+        )
+        self.ultrasound_batch_requested.emit(
+            BatchInferenceRequest(
+                request_id=request_id,
+                items=items,
+                tasks=tasks,
+                save_image_data=self._actions.save_with_image_data.isChecked(),
+            )
+        )
+
+    @QtCore.Slot(str, int, int, str)
+    def _on_ultrasound_batch_progress(
+        self,
+        request_id: str,
+        completed: int,
+        total: int,
+        image_path: str,
+    ) -> None:
+        if request_id != self._ultrasound_batch_request_id:
+            return
+        self.show_status_message(
+            self.tr("Folder auto-labeling %d/%d: %s")
+            % (completed, total, Path(image_path).name),
+            0,
+        )
+
+    @QtCore.Slot(object)
+    def _on_ultrasound_batch_completed(self, result: object) -> None:
+        if not isinstance(result, BatchInferenceResult):
+            raise TypeError("Expected BatchInferenceResult.")
+        if result.request_id != self._ultrasound_batch_request_id:
+            return
+        self._ultrasound_batch_request_id = None
+        self._ai_annotation.setEnabled(self._image_path is not None)
+        self._ai_annotation.set_busy()
+        for index in range(self._docks.file_list.count()):
+            item = self._docks.file_list.item(index)
+            if item is None:
+                continue
+            label_path = _resolve_label_path(
+                image_or_label_path=item.text(),
+                output_dir=self._output_dir,
+            )
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if Path(label_path).exists()
+                else Qt.CheckState.Unchecked
+            )
+        if self._image_path is not None and any(
+            _same_path(self._image_path, path) for path in result.succeeded
+        ):
+            self._load_file(image_or_label_path=self._image_path)
+        title = (
+            self.tr("Folder auto-labeling cancelled")
+            if result.cancelled
+            else self.tr("Folder auto-labeling complete")
+        )
+        details = self.tr("Created: %d\nSkipped existing: %d\nFailed: %d") % (
+            len(result.succeeded),
+            len(result.skipped),
+            len(result.failures),
+        )
+        if result.failures:
+            details += "\n\n" + "\n".join(
+                f"{Path(path).name}: {message}"
+                for path, message in result.failures[:10]
+            )
+        QtWidgets.QMessageBox.information(self, title, details)
+        self.show_status_message(title, 7000)
+
     def _on_scroll_request(self, delta: int, orientation: Qt.Orientation) -> None:
         units = -delta * 0.1  # natural scroll
         bar = self._canvas_widgets.scroll_bars[orientation]
@@ -2146,6 +2574,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self._open_image_into_state(image_path=image_or_label_path):
                 return
         assert self._annotation is not None
+        self._sync_ultrasound_review_widget()
         t0 = time.time()
         image = QtGui.QImage.fromData(self._annotation.image_data)
         logger.debug("Created QImage in {:.0f}ms", (time.time() - t0) * 1000)
@@ -2261,6 +2690,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, a0: QtGui.QCloseEvent) -> None:
         if not self._can_continue():
             a0.ignore()
+            return
+        self._ultrasound_request_id = None
+        self._ultrasound_batch_request_id = None
+        if self._ultrasound_worker is not None:
+            self._ultrasound_worker.cancel_batch()
+        if self._ultrasound_thread is not None:
+            self._ultrasound_thread.quit()
         self._window_state.setValue("window/size", self.size())
         self._window_state.setValue("window/position", self.pos())
         self._window_state.setValue("window/state", self.saveState())
@@ -2667,12 +3103,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mark_dirty()
 
     def delete_selected_shapes(self) -> None:
+        canvas = self._canvas_widgets.canvas
+        if canvas.has_vertex_marquee:
+            selected_count = len(canvas.selected_vertex_indices)
+            if selected_count == 0:
+                self.show_status_message(
+                    self.tr("No polygon points are inside the selection box."),
+                    5000,
+                )
+                return
+            if not canvas.delete_selected_vertices():
+                self.show_status_message(
+                    self.tr(
+                        "Cannot delete these points because a polygon must "
+                        "keep at least 3 points."
+                    ),
+                    5000,
+                )
+                return
+            self.mark_dirty()
+            self.show_status_message(
+                self.tr("Deleted %d selected polygon points.") % selected_count,
+                5000,
+            )
+            return
         msg = self.tr(
             "Permanently delete {} shapes? This action cannot be undone."
-        ).format(len(self._canvas_widgets.canvas.selected_shapes))
+        ).format(len(canvas.selected_shapes))
         if not self._confirm_deletion(message=msg):
             return
-        self.remove_labels(self._canvas_widgets.canvas.delete_selected())
+        self.remove_labels(canvas.delete_selected())
         self.mark_dirty()
         if self.has_no_shapes():
             for action in self._actions.on_shapes_present:
@@ -2717,7 +3177,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         default_open_dir_path: str
-        if self._prev_opened_dir and Path(self._prev_opened_dir).exists():
+        try:
+            ultrasound_root = load_annotation_root()
+        except UltrasoundConfigError as exc:
+            logger.warning("Ignoring invalid ultrasound annotation_root: {}", exc)
+            ultrasound_root = None
+        if ultrasound_root is not None:
+            default_open_dir_path = str(ultrasound_root)
+        elif self._prev_opened_dir and Path(self._prev_opened_dir).exists():
             default_open_dir_path = self._prev_opened_dir
         else:
             default_open_dir_path = (
@@ -2905,6 +3372,12 @@ def _resolve_label_path(*, image_or_label_path: str, output_dir: Path | None) ->
     image_path = Path(image_or_label_path)
     parent = output_dir if output_dir is not None else image_path.parent
     return str(parent / f"{image_path.stem}{LABEL_FILE_SUFFIX}")
+
+
+def _same_path(left: str, right: str) -> bool:
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+        os.path.abspath(right)
+    )
 
 
 def _make_image_list_item(
