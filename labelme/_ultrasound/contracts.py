@@ -11,7 +11,8 @@ import numpy.typing as npt
 type PolygonPoint = tuple[float, float]
 type UltrasoundTarget = Literal["eye_muscle", "skin"]
 type LabelmeUltrasoundLabel = Literal["EMA", "skin", "fat"]
-type UltrasoundTask = LabelmeUltrasoundLabel
+type MeasurementCode = Literal["EMW", "EMD", "FD", "SD"]
+type UltrasoundTask = LabelmeUltrasoundLabel | MeasurementCode
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,9 @@ class InferenceRequest:
     image_path: str
     image: npt.NDArray[np.uint8]
     tasks: tuple[UltrasoundTask, ...] = ("EMA", "fat", "skin")
+    depth_setting_mm: float | None = None
+    original_image_path: str | None = None
+    existing_segmentations: tuple[ExistingSegmentation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +78,10 @@ class InferenceResult:
     request_id: str
     image_path: str
     predictions: tuple[AnnotationPrediction, ...]
+    measurements: tuple[MeasurementResult, ...] = ()
+    calibration: Calibration | None = None
+    depth_setting_mm: float | None = None
+    original_image_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +90,8 @@ class BatchInferenceItem:
 
     image_path: str
     label_path: str
+    depth_setting_mm: float | None = None
+    original_image_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,3 +135,35 @@ class ProcessedSegmentation:
 
     annotation: AnnotationPrediction
     mask: npt.NDArray[np.bool_]
+
+
+@dataclass(frozen=True)
+class ExistingSegmentation:
+    """An editable Labelme polygon rasterized in the opened image space."""
+
+    label: LabelmeUltrasoundLabel
+    mask: npt.NDArray[np.bool_]
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """Per-image physical scale derived from the cropped image and CSV depth."""
+
+    depth_setting_mm: float
+    image_height_px: int
+    pixel_size_x_mm: float
+    pixel_size_y_mm: float
+    source: Literal["csv"] = "csv"
+
+
+@dataclass(frozen=True)
+class MeasurementResult:
+    """Framework-independent measurement value and optional editable segment."""
+
+    code: MeasurementCode
+    value_mm: float | None
+    segment: tuple[PolygonPoint, PolygonPoint] | None
+    valid: bool
+    method_version: str
+    error: str | None = None
+    diagnostics: dict[str, object] | None = None

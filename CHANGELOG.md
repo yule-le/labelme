@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added modular `EMW`, `EMD`, `FD`, and `SD` line measurements for current-image and folder ultrasound runs, with FD/SD measured vertically from the EMD top endpoint, per-image millimetre calibration imported from CSV `filename`/`depth_ocr_mm` columns, editable native Labelme lines, reuse of reviewed segmentation polygons, and self-contained calibration and versioned measurement metadata in JSON. <!-- Add the PR link once assigned. -->
 - Added non-blocking transverse-ultrasound controls to the AI-Assisted Annotation toolbar, with independent EMA/skin task selection, fat derived on demand from the edited canvas boundaries, an opt-in image-level expert-review marker, current-image and skip-existing folder runs, cancellation, failure summaries, reversible ROI coordinates, one-step undo, and ordinary editable Labelme polygons without auto-generated metadata. <!-- Add the PR link once assigned. -->
 - Added Shift-drag marquee selection for vertices of one selected polygon; Delete removes the selected vertices and reconnects retained neighbors, Escape cancels, Undo restores the edit, and the operation is blocked if fewer than three polygon points would remain. <!-- Add the PR link once assigned. -->
 
 ### Changed
 
+- Split the transverse-ultrasound toolbar into side-by-side `Segmentation` and `Measurement` groups, each with independent current-image and folder runs; measurement selection, depth CSV import, and calibration status now live together. <!-- Add the PR link once assigned. -->
 - Changed Open Folder to start from the optional local ultrasound `annotation_root`, allowing users to select a transverse ROI batch directly while retaining the normal fallback when it is not configured. <!-- Add the PR link once assigned. -->
 - Changed polygon refinement so a plain left-click on the edge of an already selected polygon inserts a new editable vertex; the first click on an unselected polygon still only selects it, while Alt-click and the context-menu action remain available. <!-- Add the PR link once assigned. -->
 - Replaced the ultrasound toolbar's AI Text-to-Annotation panel with independent, default-off `Needs expert review` and `Model failure` image-status checkboxes, persisted together in the extensible `ultrasoundReview` object without modifying shape metadata. <!-- Add the PR link once assigned. -->

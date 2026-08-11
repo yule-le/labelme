@@ -51,12 +51,21 @@ from ._ultrasound import AnnotationPrediction
 from ._ultrasound import BatchInferenceItem
 from ._ultrasound import BatchInferenceRequest
 from ._ultrasound import BatchInferenceResult
+from ._ultrasound import ExistingSegmentation
 from ._ultrasound import InferenceRequest
 from ._ultrasound import InferenceResult
 from ._ultrasound import ProcessedSegmentation
+from ._ultrasound import UltrasoundTask
 from ._ultrasound.config import UltrasoundConfigError
 from ._ultrasound.config import load_annotation_root
+from ._ultrasound.depth_manifest import DepthManifest
+from ._ultrasound.depth_manifest import DepthManifestEntry
+from ._ultrasound.depth_manifest import DepthManifestError
+from ._ultrasound.labelme_adapter import measurement_to_shape
 from ._ultrasound.labelme_adapter import prediction_to_shape
+from ._ultrasound.labelme_adapter import update_depth_metadata
+from ._ultrasound.labelme_adapter import update_ultrasound_metadata
+from ._ultrasound.measurement import MEASUREMENT_CODES
 from ._ultrasound.strategies import derive_fat_segmentation
 from ._ultrasound.worker import UltrasoundInferenceWorker
 from ._widgets import AiAssistedAnnotationWidget
@@ -78,6 +87,7 @@ from ._widgets import format_shape_label
 
 LABEL_COLORMAP: NDArray[np.uint8] = imgviz.label_colormap()
 _ULTRASOUND_REVIEW_KEY: Final[str] = "ultrasoundReview"
+_ULTRASOUND_METADATA_KEY: Final[str] = "ultrasoundMetadata"
 
 
 class _ZoomMode(enum.Enum):
@@ -218,6 +228,7 @@ class MainWindow(QtWidgets.QMainWindow):
     _ultrasound_worker: UltrasoundInferenceWorker | None = None
     _ultrasound_request_id: str | None = None
     _ultrasound_batch_request_id: str | None = None
+    _depth_manifest: DepthManifest | None = None
 
     def __init__(
         self,
@@ -252,10 +263,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._menus = self._setup_menus()
         self._configure_menu_fonts()
 
+        self._depth_manifest = None
         self._ai_annotation = AiAssistedAnnotationWidget(
-            on_run_current=self._start_ultrasound_auto_label,
-            on_run_folder=self._start_or_cancel_ultrasound_batch,
+            on_run_segmentation_current=lambda: self._start_ultrasound_auto_label(
+                self._ai_annotation.selected_segmentation_tasks
+            ),
+            on_run_segmentation_folder=lambda: self._start_or_cancel_ultrasound_batch(
+                self._ai_annotation.selected_segmentation_tasks
+            ),
+            on_run_measurement_current=lambda: self._start_ultrasound_auto_label(
+                self._ai_annotation.selected_measurement_tasks
+            ),
+            on_run_measurement_folder=lambda: self._start_or_cancel_ultrasound_batch(
+                self._ai_annotation.selected_measurement_tasks
+            ),
             on_generate_fat=self._generate_fat_from_edited_shapes,
+            on_import_depth_csv=self._import_depth_csv,
             parent=self,
         )
         self._ai_annotation.setEnabled(False)
@@ -1492,6 +1515,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._image_path = None
         self._label_file_path = None
         self._ultrasound_review.set_status(review_required=False, model_failure=False)
+        self._sync_depth_status()
         self._canvas_widgets.canvas.reset_state()
 
     # Callbacks
@@ -1826,6 +1850,14 @@ class MainWindow(QtWidgets.QMainWindow):
             widget.addItem(item)
 
     def save_labels(self, label_path: str) -> bool:
+        entry = self._depth_entry(self._image_path)
+        if entry is not None and self._annotation is not None:
+            update_depth_metadata(
+                self._annotation.other_data,
+                depth_setting_mm=entry.depth_setting_mm,
+                original_image_path=entry.original_image_path,
+            )
+        self._sync_edited_measurement_values()
         shapes = [
             _shape_to_dict(s)
             for item in self._docks.label_list
@@ -1865,6 +1897,49 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.tr("Error saving label data"), self.tr("<b>%s</b>") % e
             )
             return False
+
+    def _sync_edited_measurement_values(self) -> None:
+        """Recompute persisted values after a user edits measurement lines."""
+
+        if self._annotation is None:
+            return
+        metadata = self._annotation.other_data.get(_ULTRASOUND_METADATA_KEY)
+        if not isinstance(metadata, dict):
+            return
+        calibration = metadata.get("calibration")
+        measurements = metadata.get("measurements")
+        if not isinstance(calibration, dict) or not isinstance(measurements, dict):
+            return
+        try:
+            pixel_x = float(calibration["pixelSizeXMm"])
+            pixel_y = float(calibration["pixelSizeYMm"])
+        except (KeyError, TypeError, ValueError):
+            return
+        for shape in self._canvas_widgets.canvas.shapes:
+            if (
+                shape.label not in MEASUREMENT_CODES
+                or shape.shape_type != "line"
+                or len(shape.points) != 2
+            ):
+                continue
+            delta = shape.points[1] - shape.points[0]
+            value_mm = float(np.hypot(delta[0] * pixel_x, delta[1] * pixel_y))
+            code = shape.label
+            payload = measurements.get(code)
+            if not isinstance(payload, dict):
+                payload = {}
+                measurements[code] = payload
+            payload["valueMm"] = value_mm
+            payload["valid"] = True
+            stored_measurement_data = shape.other_data.get("ultrasoundMeasurement")
+            if isinstance(stored_measurement_data, dict):
+                measurement_data = cast(dict[str, object], stored_measurement_data)
+            else:
+                measurement_data = cast(dict[str, object], {"code": code})
+                shape.other_data["ultrasoundMeasurement"] = measurement_data
+            measurement_data["valueMm"] = value_mm
+            measurement_data["valid"] = True
+            shape.description = f"{code}: {value_mm:.2f} mm"
 
     def _insert_shapes(self, shapes: list[Shape]) -> None:
         if not shapes:
@@ -2005,6 +2080,70 @@ class MainWindow(QtWidgets.QMainWindow):
             review_required=required, model_failure=model_failure
         )
 
+    def _import_depth_csv(self) -> None:
+        csv_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            self.tr("Import ultrasound depth CSV"),
+            self.current_path(),
+            self.tr("CSV files (*.csv)"),
+        )
+        if not csv_path:
+            return
+        try:
+            manifest = DepthManifest.load(csv_path)
+        except DepthManifestError as exc:
+            self.show_error_message(
+                self.tr("Cannot import depth CSV"), self.tr("<b>%s</b>") % exc
+            )
+            return
+        self._depth_manifest = manifest
+        matched = manifest.matched_count(self.image_list)
+        self._ai_annotation.set_manifest_summary(
+            matched=matched, total=len(self.image_list)
+        )
+        self._sync_depth_status()
+        self.show_status_message(
+            self.tr("Imported depth CSV: matched %d of %d folder images.")
+            % (matched, len(self.image_list)),
+            7000,
+        )
+
+    def _depth_entry(self, image_path: str | None) -> DepthManifestEntry | None:
+        if self._depth_manifest is None or image_path is None:
+            return None
+        return self._depth_manifest.lookup(image_path)
+
+    def _sync_depth_status(self) -> None:
+        entry = self._depth_entry(self._image_path)
+        self._ai_annotation.set_depth_status(
+            entry.depth_setting_mm if entry is not None else None
+        )
+
+    def _existing_measurement_segmentations(
+        self,
+    ) -> tuple[ExistingSegmentation, ...]:
+        image_shape = (self._image.height(), self._image.width())
+        output: list[ExistingSegmentation] = []
+        for label in ("EMA", "fat", "skin"):
+            matching = [
+                shape
+                for shape in self._canvas_widgets.canvas.shapes
+                if shape.label == label and shape.shape_type == "polygon"
+            ]
+            if len(matching) != 1:
+                continue
+            output.append(
+                ExistingSegmentation(
+                    label=cast(typing.Any, label),
+                    mask=_utils.shape_to_mask(
+                        img_shape=image_shape,
+                        points=matching[0].points.tolist(),
+                        shape_type="polygon",
+                    ),
+                )
+            )
+        return tuple(output)
+
     def _generate_fat_from_edited_shapes(self) -> None:
         if self._image_path is None:
             self.show_status_message(
@@ -2091,7 +2230,9 @@ class MainWindow(QtWidgets.QMainWindow):
             7000,
         )
 
-    def _start_ultrasound_auto_label(self, _value: bool = False) -> None:
+    def _start_ultrasound_auto_label(
+        self, tasks: tuple[UltrasoundTask, ...] | None = None
+    ) -> None:
         if self._image_path is None:
             self.show_status_message(
                 self.tr("Open an image before auto-labeling."), 5000
@@ -2105,10 +2246,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.tr("Ultrasound auto-labeling is already running."), 5000
             )
             return
-        tasks = self._ai_annotation.selected_tasks
+        tasks = self._ai_annotation.selected_tasks if tasks is None else tasks
         if not tasks:
             self.show_status_message(
                 self.tr("Select at least one ultrasound task."), 5000
+            )
+            return
+
+        measurement_codes = tuple(task for task in tasks if task in MEASUREMENT_CODES)
+        depth_entry = self._depth_entry(self._image_path)
+        if measurement_codes and depth_entry is None:
+            self.show_error_message(
+                self.tr("Missing ultrasound depth"),
+                self.tr(
+                    "Import a CSV containing filename and depth_ocr_mm for "
+                    "this cropped image before generating "
+                    "EMW, EMD, FD or SD."
+                ),
             )
             return
 
@@ -2121,6 +2275,15 @@ class MainWindow(QtWidgets.QMainWindow):
             image_path=image_path,
             image=image,
             tasks=tasks,
+            depth_setting_mm=(
+                depth_entry.depth_setting_mm if depth_entry is not None else None
+            ),
+            original_image_path=(
+                depth_entry.original_image_path if depth_entry is not None else None
+            ),
+            existing_segmentations=(
+                self._existing_measurement_segmentations() if measurement_codes else ()
+            ),
         )
         self._ultrasound_request_id = request_id
         self._ai_annotation.set_busy(current=True)
@@ -2163,27 +2326,51 @@ class MainWindow(QtWidgets.QMainWindow):
                 7000,
             )
             return
-        if not result.predictions:
+        if not result.predictions and not result.measurements:
             self.show_status_message(
                 self.tr("The ultrasound models produced no annotations."), 7000
             )
             return
 
         shapes = [prediction_to_shape(item) for item in result.predictions]
+        shapes.extend(
+            shape
+            for measurement in result.measurements
+            if (shape := measurement_to_shape(measurement)) is not None
+        )
         canvas = self._canvas_widgets.canvas
         if not canvas.shape_backups:
             canvas.backup_shapes()
-        generated_labels = {shape.label for shape in shapes}
+        generated_labels = {shape.label for shape in shapes} | {
+            measurement.code for measurement in result.measurements
+        }
         retained_shapes = [
             shape for shape in canvas.shapes if shape.label not in generated_labels
         ]
         self._docks.label_list.clear()
         self._load_shapes(shapes=[*retained_shapes, *shapes], replace=True)
-        canvas.select_shapes(shapes)
+        if shapes:
+            canvas.select_shapes(shapes)
+        if result.calibration is not None:
+            assert self._annotation is not None
+            update_ultrasound_metadata(
+                self._annotation.other_data,
+                calibration=result.calibration,
+                original_image_path=result.original_image_path,
+                measurements=result.measurements,
+            )
         self.mark_dirty()
+        invalid = [item.code for item in result.measurements if not item.valid]
         self.show_status_message(
-            self.tr("Added ultrasound polygons: %s. Review them before saving.")
-            % ", ".join(shape.label or "" for shape in shapes),
+            self.tr("Generated ultrasound outputs: %s.%s Review them before saving.")
+            % (
+                ", ".join(shape.label or "" for shape in shapes) or self.tr("metadata"),
+                (
+                    self.tr(" Invalid measurements: %s.") % ", ".join(invalid)
+                    if invalid
+                    else ""
+                ),
+            ),
             7000,
         )
 
@@ -2206,15 +2393,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ai_annotation.setEnabled(self._image_path is not None)
         self._ai_annotation.set_busy()
 
-    def _start_or_cancel_ultrasound_batch(self) -> None:
+    def _start_or_cancel_ultrasound_batch(
+        self, tasks: tuple[UltrasoundTask, ...] | None = None
+    ) -> None:
         if self._ultrasound_batch_request_id is not None:
             if self._ultrasound_worker is not None:
                 self._ultrasound_worker.cancel_batch()
             self.show_status_message(self.tr("Cancelling after the current image…"), 0)
             return
-        self._start_ultrasound_batch()
+        self._start_ultrasound_batch(tasks)
 
-    def _start_ultrasound_batch(self) -> None:
+    def _start_ultrasound_batch(
+        self, tasks: tuple[UltrasoundTask, ...] | None = None
+    ) -> None:
         if self._ultrasound_request_id is not None:
             self.show_status_message(
                 self.tr("Wait for the current-image inference to finish."), 5000
@@ -2230,10 +2421,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
             )
             return
-        tasks = self._ai_annotation.selected_tasks
+        tasks = self._ai_annotation.selected_tasks if tasks is None else tasks
         if not tasks:
             self.show_status_message(
                 self.tr("Select at least one ultrasound task."), 5000
+            )
+            return
+        has_measurements = bool(set(tasks) & set(MEASUREMENT_CODES))
+        if has_measurements and self._depth_manifest is None:
+            self.show_error_message(
+                self.tr("Depth CSV required"),
+                self.tr(
+                    "Import a CSV containing filename and depth_ocr_mm before "
+                    "running folder measurements."
+                ),
             )
             return
         image_paths = self.image_list
@@ -2242,17 +2443,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.tr("Open an image folder before running a batch."), 5000
             )
             return
-        items = tuple(
-            BatchInferenceItem(
-                image_path=image_path,
-                label_path=_resolve_label_path(
-                    image_or_label_path=image_path,
-                    output_dir=self._output_dir,
-                ),
+        items_list: list[BatchInferenceItem] = []
+        for image_path in image_paths:
+            depth_entry = self._depth_entry(image_path)
+            items_list.append(
+                BatchInferenceItem(
+                    image_path=image_path,
+                    label_path=_resolve_label_path(
+                        image_or_label_path=image_path,
+                        output_dir=self._output_dir,
+                    ),
+                    depth_setting_mm=(
+                        depth_entry.depth_setting_mm
+                        if depth_entry is not None
+                        else None
+                    ),
+                    original_image_path=(
+                        depth_entry.original_image_path
+                        if depth_entry is not None
+                        else None
+                    ),
+                )
             )
-            for image_path in image_paths
+        items = tuple(items_list)
+        pending = (
+            len(items)
+            if has_measurements
+            else sum(not Path(item.label_path).exists() for item in items)
         )
-        pending = sum(not Path(item.label_path).exists() for item in items)
         if pending == 0:
             self.show_status_message(
                 self.tr("Every image in this folder already has a JSON file."),
@@ -2263,12 +2481,20 @@ class MainWindow(QtWidgets.QMainWindow):
         answer = QtWidgets.QMessageBox.question(
             self,
             self.tr("Run folder auto-labeling"),
-            self.tr(
-                "Generate %s for %d unannotated image(s)?\n\n"
-                "Existing JSON files will be skipped.\n"
-                "Output: %s"
-            )
-            % (", ".join(tasks), pending, output_description),
+            self.tr("Generate %s for %d image(s)?\n\n%s\nOutput: %s")
+            % (
+                ", ".join(tasks),
+                pending,
+                (
+                    self.tr(
+                        "Existing polygons will be reused and selected "
+                        "measurements replaced."
+                    )
+                    if has_measurements
+                    else self.tr("Existing JSON files will be skipped.")
+                ),
+                output_description,
+            ),
             QtWidgets.QMessageBox.StandardButton.Yes
             | QtWidgets.QMessageBox.StandardButton.Cancel,
             QtWidgets.QMessageBox.StandardButton.Cancel,
@@ -2340,7 +2566,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if result.cancelled
             else self.tr("Folder auto-labeling complete")
         )
-        details = self.tr("Created: %d\nSkipped existing: %d\nFailed: %d") % (
+        details = self.tr("Processed: %d\nSkipped existing: %d\nFailed: %d") % (
             len(result.succeeded),
             len(result.skipped),
             len(result.failures),
@@ -2575,6 +2801,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
         assert self._annotation is not None
         self._sync_ultrasound_review_widget()
+        self._sync_depth_status()
         t0 = time.time()
         image = QtGui.QImage.fromData(self._annotation.image_data)
         logger.debug("Created QImage in {:.0f}ms", (time.time() - t0) * 1000)

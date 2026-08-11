@@ -11,10 +11,14 @@ def test_ultrasound_toolbar_defaults_and_callbacks(qtbot: QtBot) -> None:
     current_calls: list[bool] = []
     folder_calls: list[bool] = []
     fat_calls: list[bool] = []
+    csv_calls: list[bool] = []
     widget = AiAssistedAnnotationWidget(
-        on_run_current=lambda: current_calls.append(True),
-        on_run_folder=lambda: folder_calls.append(True),
+        on_run_segmentation_current=lambda: current_calls.append(True),
+        on_run_segmentation_folder=lambda: folder_calls.append(True),
+        on_run_measurement_current=lambda: current_calls.append(False),
+        on_run_measurement_folder=lambda: folder_calls.append(False),
         on_generate_fat=lambda: fat_calls.append(True),
+        on_import_depth_csv=lambda: csv_calls.append(True),
     )
     qtbot.addWidget(widget)
 
@@ -24,12 +28,26 @@ def test_ultrasound_toolbar_defaults_and_callbacks(qtbot: QtBot) -> None:
     with pytest.raises(ValueError, match="edited EMA and skin"):
         widget.set_task_checked("fat", True)
 
-    widget._run_current_button.click()
-    widget._run_folder_button.click()
+    widget._run_segmentation_current_button.click()
+    widget._run_segmentation_folder_button.click()
+    widget._run_measurement_current_button.click()
+    widget._run_measurement_folder_button.click()
     widget._generate_fat_button.click()
-    assert current_calls == [True]
-    assert folder_calls == [True]
+    widget._import_depth_button.click()
+    assert current_calls == [True, False]
+    assert folder_calls == [True, False]
     assert fat_calls == [True]
+    assert csv_calls == [True]
+
+    widget.set_task_checked("EMD", True)
+    widget.set_task_checked("EMW", True)
+    widget.set_task_checked("FD", True)
+    assert widget.selected_tasks == ("EMA", "EMD", "EMW", "FD")
+    assert widget.selected_segmentation_tasks == ("EMA",)
+    assert widget.selected_measurement_tasks == ("EMD", "EMW", "FD")
+
+    widget.set_depth_status(100.0)
+    assert widget._depth_status.text() == "Depth: 100.00 mm (CSV)"
 
 
 def test_review_status_defaults_off_and_checkboxes_are_independent(

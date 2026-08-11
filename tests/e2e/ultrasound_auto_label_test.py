@@ -16,7 +16,9 @@ from labelme._app import MainWindow
 from labelme._shape import Shape
 from labelme._ultrasound import AnnotationPrediction
 from labelme._ultrasound import BatchInferenceRequest
+from labelme._ultrasound import Calibration
 from labelme._ultrasound import InferenceResult
+from labelme._ultrasound import MeasurementResult
 
 from ..conftest import close_or_pause
 from .conftest import MainWinFactory
@@ -114,6 +116,119 @@ def test_ema_result_is_one_undoable_operation_and_round_trips(
     )
 
     close_or_pause(qtbot=qtbot, widget=reopened, pause=pause)
+
+
+@pytest.mark.gui
+def test_measurement_lines_and_metadata_round_trip_and_follow_manual_edit(
+    main_win: MainWinFactory,
+    qtbot: QtBot,
+    tmp_path: Path,
+    pause: bool,
+) -> None:
+    image_path = tmp_path / "measurement.png"
+    Image.new("RGB", (320, 240), color=(80, 80, 80)).save(image_path)
+    win = main_win(
+        file_or_dir=str(image_path),
+        config_overrides={"auto_save": False},
+        output_dir=str(tmp_path),
+    )
+    show_window_and_wait_for_imagedata(qtbot=qtbot, win=win)
+    calibration = Calibration(
+        depth_setting_mm=100.0,
+        image_height_px=240,
+        pixel_size_x_mm=100.0 / 240.0,
+        pixel_size_y_mm=100.0 / 240.0,
+    )
+    measurements = tuple(
+        MeasurementResult(
+            code=code,
+            value_mm=10.0,
+            segment=segment,
+            valid=True,
+            method_version=method,
+        )
+        for code, segment, method in (
+            ("EMW", ((10.0, 20.0), (100.0, 20.0)), "geom-depth-width-v1.1"),
+            ("EMD", ((50.0, 100.0), (50.0, 40.0)), "geom-depth-width-v1.1"),
+            ("FD", ((50.0, 35.0), (50.0, 25.0)), "eye-axis-layer-depth-v1"),
+            ("SD", ((50.0, 20.0), (50.0, 15.0)), "eye-axis-layer-depth-v1"),
+        )
+    )
+    request_id = "measurement-result"
+    win._ultrasound_request_id = request_id
+    win._on_ultrasound_inference_completed(
+        InferenceResult(
+            request_id=request_id,
+            image_path=os.path.abspath(image_path),
+            predictions=(),
+            measurements=measurements,
+            calibration=calibration,
+            depth_setting_mm=100.0,
+            original_image_path="backend/data/raw/batch/measurement.png",
+        )
+    )
+
+    canvas = win._canvas_widgets.canvas
+    assert [shape.label for shape in canvas.shapes] == ["EMW", "EMD", "FD", "SD"]
+    assert all(shape.shape_type == "line" for shape in canvas.shapes)
+    emw = canvas.shapes[0]
+    emw.move_vertex(1, np.array([130.0, 20.0]))
+
+    label_path = image_path.with_suffix(".json")
+    assert win.save_labels(label_path=str(label_path))
+    payload = json.loads(label_path.read_text(encoding="utf-8"))
+    metadata = payload["ultrasoundMetadata"]
+    assert metadata["depthSettingMm"] == 100.0
+    assert metadata["originalImagePath"].endswith("measurement.png")
+    assert metadata["calibration"]["roiHeightPx"] == 240
+    assert metadata["measurements"]["EMW"]["valueMm"] == pytest.approx(50.0)
+    assert payload["shapes"][0]["ultrasoundMeasurement"]["valueMm"] == pytest.approx(
+        50.0
+    )
+
+    win.mark_clean()
+    close_or_pause(qtbot=qtbot, widget=win, pause=pause)
+
+
+@pytest.mark.gui
+def test_import_depth_csv_matches_cropped_image_filename(
+    main_win: MainWinFactory,
+    qtbot: QtBot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pause: bool,
+) -> None:
+    image_path = tmp_path / "2026Jul29-10.50.59.jpg"
+    Image.new("RGB", (320, 240), color=(80, 80, 80)).save(image_path)
+    csv_path = tmp_path / "manifest.csv"
+    csv_path.write_text(
+        "sample_id,filename,depth_ocr_text,depth_ocr_mm,ocr_status\n"
+        "s_123,2026Jul29-10.50.59.jpg,10,100,ok\n",
+        encoding="utf-8",
+    )
+    win = main_win(file_or_dir=str(image_path), output_dir=str(tmp_path))
+    show_window_and_wait_for_imagedata(qtbot=qtbot, win=win)
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileName",
+        lambda *args, **kwargs: (str(csv_path), "CSV files (*.csv)"),
+    )
+
+    win._import_depth_csv()
+
+    entry = win._depth_entry(str(image_path))
+    assert entry is not None
+    assert entry.depth_setting_mm == 100.0
+    assert win._ai_annotation._depth_status.text() == "Depth: 100.00 mm (CSV)"
+    label_path = image_path.with_suffix(".json")
+    assert win.save_labels(label_path=str(label_path))
+    payload = json.loads(label_path.read_text(encoding="utf-8"))
+    assert payload["ultrasoundMetadata"]["depthSettingMm"] == 100.0
+    assert (
+        payload["ultrasoundMetadata"]["sourceFilename"]
+        == "2026Jul29-10.50.59.jpg"
+    )
+    close_or_pause(qtbot=qtbot, widget=win, pause=pause)
 
 
 @pytest.mark.gui
